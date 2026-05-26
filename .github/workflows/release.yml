@@ -1,0 +1,62 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'          # Triggers on tags like v1.0, v1.2.3, etc.
+
+permissions:
+  contents: write    # Needed to create GitHub Releases
+
+jobs:
+  build-windows:
+    name: Build Windows Executable
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -r requirements.txt
+
+      - name: Build executable
+        run: pyinstaller firma_rapida.spec --noconfirm
+
+      - name: Verify executable was created
+        run: |
+          if (!(Test-Path "dist\FirmaRapida.exe")) {
+            Write-Error "Build failed: FirmaRapida.exe not found"
+            exit 1
+          }
+          $size = (Get-Item "dist\FirmaRapida.exe").Length / 1MB
+          Write-Host "FirmaRapida.exe built successfully ($([math]::Round($size,1)) MB)"
+
+      - name: Create Release and Upload Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Firma Rapida ${{ github.ref_name }}"
+          body: |
+            ## Firma Rapida ${{ github.ref_name }}
+
+            Herramienta de firma digital de PDFs para Windows.
+
+            ### Instalación
+            1. Descarga `FirmaRapida.exe`
+            2. Ejecuta directamente — **no requiere instalación**
+
+            ### Requisitos del sistema
+            - Windows 10 / 11 (64-bit)
+            - Para firmar documentos Word (`.docx`): requiere Microsoft Word o LibreOffice instalado
+          files: dist/FirmaRapida.exe
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
