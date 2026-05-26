@@ -110,10 +110,40 @@ if _missing:
 # ── Word to PDF Conversion ─────────────────────────────────────────
 
 
+def _convert_via_word_com_direct(docx_path, pdf_output_path):
+    """
+    Convert using Word COM automation via dynamic dispatch.
+    dynamic.Dispatch skips the gencache step that fails in frozen executables.
+    """
+    import pythoncom
+    import win32com.client.dynamic as dynamic
+
+    pythoncom.CoInitialize()
+    word = None
+    doc = None
+    try:
+        word = dynamic.Dispatch("Word.Application")
+        word.Visible = False
+        doc = word.Documents.Open(os.path.abspath(docx_path))
+        doc.SaveAs(os.path.abspath(pdf_output_path), FileFormat=17)  # 17 = wdFormatPDF
+    finally:
+        try:
+            if doc is not None:
+                doc.Close(SaveChanges=0)
+        except Exception:
+            pass
+        try:
+            if word is not None:
+                word.Quit()
+        except Exception:
+            pass
+        pythoncom.CoUninitialize()
+
+
 def convert_docx_to_pdf(docx_path, pdf_output_path=None):
     """
     Convert a .docx file to PDF.
-    Tries docx2pdf (uses MS Word COM) first, then falls back to LibreOffice.
+    Tries direct Word COM first, then docx2pdf, then LibreOffice.
     Returns the path to the generated PDF.
     """
     docx_path = str(docx_path)
@@ -121,16 +151,31 @@ def convert_docx_to_pdf(docx_path, pdf_output_path=None):
     if pdf_output_path is None:
         pdf_output_path = str(Path(docx_path).with_suffix(".pdf"))
 
-    # Method 1: docx2pdf (requires Microsoft Word installed)
+    # Method 1: direct Word COM via dynamic dispatch (works in frozen exes)
+    errors = []
+    try:
+        _convert_via_word_com_direct(docx_path, pdf_output_path)
+        if os.path.exists(pdf_output_path):
+            return pdf_output_path
+    except Exception as e:
+        errors.append(f"Word COM directo: {e}")
+
+    # Method 2: docx2pdf (fallback, also uses Word COM but via early binding)
     if _has_docx2pdf:
         try:
-            docx2pdf_convert(docx_path, pdf_output_path)
+            import pythoncom
+
+            pythoncom.CoInitialize()
+            try:
+                docx2pdf_convert(docx_path, pdf_output_path)
+            finally:
+                pythoncom.CoUninitialize()
             if os.path.exists(pdf_output_path):
                 return pdf_output_path
         except Exception as e:
-            print(f"docx2pdf fallo: {e}")
+            errors.append(f"docx2pdf: {e}")
 
-    # Method 2: LibreOffice command line (fallback)
+    # Method 3: LibreOffice command line (fallback)
     for lo_path in [
         r"C:\Program Files\LibreOffice\program\soffice.exe",
         r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
@@ -159,10 +204,12 @@ def convert_docx_to_pdf(docx_path, pdf_output_path=None):
                         shutil.move(lo_output, pdf_output_path)
                     return pdf_output_path
             except Exception as e:
-                print(f"LibreOffice fallo: {e}")
+                errors.append(f"LibreOffice: {e}")
 
+    error_detail = "\n".join(errors) if errors else "(sin detalles)"
     raise RuntimeError(
         "No se pudo convertir el documento Word a PDF.\n\n"
+        f"Errores:\n{error_detail}\n\n"
         "Instale una de estas opciones:\n"
         "  1. pip install docx2pdf  (requiere Microsoft Word)\n"
         "  2. LibreOffice (https://www.libreoffice.org)\n\n"

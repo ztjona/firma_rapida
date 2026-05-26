@@ -43,6 +43,12 @@ all_hidden = (
         'qrcode',
         'qrcode.image.pure',
         'qrcode.image.base',
+        'pythoncom',
+        'pywintypes',
+        'win32com',
+        'win32com.client',
+        'win32com.client.dynamic',
+        'win32com.client.gencache',
     ]
 )
 
