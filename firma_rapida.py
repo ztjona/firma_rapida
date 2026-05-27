@@ -309,6 +309,65 @@ class SigPos:
 # ── PDF Signing Engine ─────────────────────────────────────────────
 
 
+def _display_box_to_raw_pdf_box(display_box, rotation, page_rect, mediabox):
+    """
+    Convert a signature bounding box from GUI display coordinates to raw PDF
+    user-space coordinates (as expected by pyHanko's SigFieldSpec).
+
+    The GUI computes positions in the *displayed* page coordinate system, which
+    PyMuPDF presents after applying the PDF /Rotate entry.  pyHanko writes the
+    field into the *raw* PDF user space (before rotation).  When the two differ
+    the field ends up off-page and the signature is invisible.
+
+    display_box : (x1, y1, x2, y2) – y-up, bottom-left origin, display dims.
+    rotation    : PDF /Rotate value (0, 90, 180 or 270).
+    page_rect   : fitz.Rect – page.rect (always starts at 0,0 in PyMuPDF).
+    mediabox    : fitz.Rect – page.mediabox (raw dimensions; may have non-zero origin).
+    """
+    x1, y1, x2, y2 = display_box
+    dw = page_rect.width    # display width  (= raw_h for /Rotate 90 or 270)
+    dh = page_rect.height   # display height (= raw_w for /Rotate 90 or 270)
+    ox = mediabox.x0        # raw origin offset X (usually 0)
+    oy = mediabox.y0        # raw origin offset Y (usually 0)
+
+    rotation = int(rotation) % 360
+
+    if rotation == 0:
+        # Display == raw (just add mediabox origin offset).
+        rx1, ry1, rx2, ry2 = x1 + ox, y1 + oy, x2 + ox, y2 + oy
+
+    elif rotation == 90:
+        # PDF /Rotate 90 = display 90° CW.
+        # Forward:  disp_x = raw_y − oy,  disp_y = dh − (raw_x − ox)
+        # Inverse:  raw_x  = dh − disp_y + ox,  raw_y = disp_x + oy
+        rx1 = dh - y2 + ox
+        ry1 = x1 + oy
+        rx2 = dh - y1 + ox
+        ry2 = x2 + oy
+
+    elif rotation == 180:
+        # Forward:  disp_x = dw − (raw_x − ox),  disp_y = dh − (raw_y − oy)
+        # Inverse:  raw_x  = dw − disp_x + ox,   raw_y = dh − disp_y + oy
+        rx1 = dw - x2 + ox
+        ry1 = dh - y2 + oy
+        rx2 = dw - x1 + ox
+        ry2 = dh - y1 + oy
+
+    elif rotation == 270:
+        # PDF /Rotate 270 = display 270° CW (= 90° CCW).
+        # Forward:  disp_x = dw − (raw_y − oy),  disp_y = raw_x − ox
+        # Inverse:  raw_x  = disp_y + ox,          raw_y = dw − disp_x + oy
+        rx1 = y1 + ox
+        ry1 = dw - x2 + oy
+        rx2 = y2 + ox
+        ry2 = dw - x1 + oy
+
+    else:
+        rx1, ry1, rx2, ry2 = x1 + ox, y1 + oy, x2 + ox, y2 + oy
+
+    return (rx1, ry1, rx2, ry2)
+
+
 def _normalize_pdf(input_path):
     """
     Re-save the PDF through PyMuPDF to normalize its internal structure.
@@ -366,7 +425,7 @@ def sign_pdf(config, input_path, output_path, positions):
         try:
             stamp_style = QRStampStyle(
                 stamp_text="%(signer)s\n%(ts)s",
-                border_width=0,
+                border_width=1,
             )
         except Exception:
             stamp_style = None
@@ -378,7 +437,7 @@ def sign_pdf(config, input_path, output_path, positions):
 
             stamp_style = TextStampStyle(
                 stamp_text="%(signer)s\n%(ts)s",
-                border_width=0,
+                border_width=1,
             )
         except Exception:
             stamp_style = None
@@ -399,6 +458,19 @@ def sign_pdf(config, input_path, output_path, positions):
         current_input = normalized
     except Exception:
         current_input = input_path
+
+    # Read page rotation / rect / mediabox from the (normalized) PDF so we can
+    # transform display-space signature boxes to raw PDF user-space coords.
+    # Page structure (rotation, mediabox) does not change when appending sigs.
+    _page_info = {}   # page_index -> (rotation, page_rect, mediabox)
+    try:
+        _info_doc = fitz.open(current_input)
+        for _pg in range(len(_info_doc)):
+            _p = _info_doc[_pg]
+            _page_info[_pg] = (_p.rotation, _p.rect, _p.mediabox)
+        _info_doc.close()
+    except Exception:
+        pass
 
     # Build appearance_text_params for QR stamps
     appearance_params = None
@@ -425,6 +497,17 @@ def sign_pdf(config, input_path, output_path, positions):
 
             field_name = f"Firma_{i + 1}_{datetime.now().strftime('%H%M%S%f')}"
 
+            # Transform the box from display coords to raw PDF user-space coords.
+            # Always apply: handles both page rotation AND non-zero MediaBox origins.
+            # CAD-generated PDFs (AutoCAD, MicroStation…) often place the coordinate
+            # origin at the centre of the page, e.g. x ∈ [-1192, 1192] instead of
+            # [0, 2384].  Without the offset the field lands hundreds of points
+            # off-screen and the signature is invisible.
+            raw_box = pos.box
+            if pos.page in _page_info:
+                rot, pg_rect, mb = _page_info[pos.page]
+                raw_box = _display_box_to_raw_pdf_box(pos.box, rot, pg_rect, mb)
+
             with open(current_input, "rb") as inf:
                 writer = IncrementalPdfFileWriter(inf, strict=False)
 
@@ -434,7 +517,7 @@ def sign_pdf(config, input_path, output_path, positions):
                     sig_field_spec=SigFieldSpec(
                         sig_field_name=field_name,
                         on_page=pos.page,
-                        box=pos.box,
+                        box=raw_box,
                     ),
                 )
 
@@ -1251,17 +1334,50 @@ class FirmaRapidaApp:
         self.pdf_doc.close()
         self.pdf_doc = None
 
+        # Remember page of first sig so we can navigate there after signing
+        _first_sig_page = self.positions[0].page if self.positions else 0
+        _signed_output = None  # set on success
+
         try:
             self.status.config(text="Firmando documento... por favor espere.")
             self.root.update_idletasks()
 
             sign_pdf(self.config, self.pdf_path, output, self.positions)
+            _signed_output = output
+
+            # ── Diagnostic: verify signature field placement in output PDF ──
+            _diag_warn = ""
+            try:
+                _d = fitz.open(output)
+                for _pgi in range(len(_d)):
+                    _pg = _d[_pgi]
+                    _pr = _pg.rect
+                    for _w in _pg.widgets():
+                        _wr = _w.rect
+                        if (
+                            _wr.x1 <= _pr.x0 or _wr.x0 >= _pr.x1
+                            or _wr.y1 <= _pr.y0 or _wr.y0 >= _pr.y1
+                        ):
+                            _diag_warn += (
+                                f"\n\u26a0 Pag.{_pgi+1}: rect de firma "
+                                f"({_wr.x0:.0f},{_wr.y0:.0f},{_wr.x1:.0f},{_wr.y1:.0f})"
+                                f" fuera de la pagina "
+                                f"({_pr.x0:.0f},{_pr.y0:.0f},{_pr.x1:.0f},{_pr.y1:.0f})"
+                            )
+                _d.close()
+            except Exception:
+                pass
+
+            msg = f"Documento firmado correctamente.\n\n{output}"
+            if _diag_warn:
+                msg += (
+                    "\n\n\u26a0 ATENCION: la firma fue colocada fuera del area"
+                    " visible de la pagina. Es posible que no se vea en el"
+                    " visor PDF." + _diag_warn
+                )
 
             self.status.config(text=f"Documento firmado: {Path(output).name}")
-            messagebox.showinfo(
-                "Firma exitosa",
-                f"Documento firmado correctamente.\n\n{output}",
-            )
+            messagebox.showinfo("Firma exitosa", msg)
             self.positions.clear()
             self.pos_listbox.delete(0, "end")
             self._selected_idx = None
@@ -1271,9 +1387,19 @@ class FirmaRapidaApp:
             self.status.config(text=f"Error: {e}")
 
         finally:
-            if self.pdf_path and os.path.exists(self.pdf_path):
-                self.pdf_doc = fitz.open(self.pdf_path)
+            # After signing, show the OUTPUT PDF so the user can immediately
+            # verify the signature appearance.  Fall back to the input on error.
+            show_path = _signed_output if (_signed_output and os.path.exists(_signed_output)) else self.pdf_path
+            if show_path and os.path.exists(show_path):
+                self.pdf_doc = fitz.open(show_path)
+                self.pdf_path = show_path
+                self.total_pages = len(self.pdf_doc)
+                self.current_page = min(_first_sig_page, self.total_pages - 1)
                 self.render_page()
+                if _signed_output:
+                    self.status.config(
+                        text="Mostrando PDF firmado. Verifique la firma en el visor."
+                    )
 
 
 # ── Entry point ────────────────────────────────────────────────────
