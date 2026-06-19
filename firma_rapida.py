@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Firma Rapida v1.2
+Firma Rapida v2.1.1
 =================
 Quick PDF Digital Signing Tool for Windows.
 
@@ -13,6 +13,8 @@ Features:
   - Visual PDF preview with draggable signature rectangles
   - Add signatures with a button, delete with Supr/Delete key
   - Multiple signature placements on the same document
+  - Replicate a signature to all pages with one click
+  - Batch signing: queue multiple files, sign them all at once
   - Page navigation and zoom
   - Configurable signature size and metadata
 
