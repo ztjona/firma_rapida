@@ -325,10 +325,10 @@ def _display_box_to_raw_pdf_box(display_box, rotation, page_rect, mediabox):
     mediabox    : fitz.Rect – page.mediabox (raw dimensions; may have non-zero origin).
     """
     x1, y1, x2, y2 = display_box
-    dw = page_rect.width    # display width  (= raw_h for /Rotate 90 or 270)
-    dh = page_rect.height   # display height (= raw_w for /Rotate 90 or 270)
-    ox = mediabox.x0        # raw origin offset X (usually 0)
-    oy = mediabox.y0        # raw origin offset Y (usually 0)
+    dw = page_rect.width  # display width  (= raw_h for /Rotate 90 or 270)
+    dh = page_rect.height  # display height (= raw_w for /Rotate 90 or 270)
+    ox = mediabox.x0  # raw origin offset X (usually 0)
+    oy = mediabox.y0  # raw origin offset Y (usually 0)
 
     rotation = int(rotation) % 360
 
@@ -462,7 +462,7 @@ def sign_pdf(config, input_path, output_path, positions):
     # Read page rotation / rect / mediabox from the (normalized) PDF so we can
     # transform display-space signature boxes to raw PDF user-space coords.
     # Page structure (rotation, mediabox) does not change when appending sigs.
-    _page_info = {}   # page_index -> (rotation, page_rect, mediabox)
+    _page_info = {}  # page_index -> (rotation, page_rect, mediabox)
     try:
         _info_doc = fitz.open(current_input)
         for _pg in range(len(_info_doc)):
@@ -758,6 +758,7 @@ class FirmaRapidaApp:
         self.current_page = 0
         self.total_pages = 0
         self.positions = []  # list of SigPos
+        self.batch_files = []  # original file paths queued for batch signing
         self.zoom = 1.0
         self.photo = None
         self.page_rect = None
@@ -841,11 +842,43 @@ class FirmaRapidaApp:
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
 
-        # Right: Signature positions panel
+        # Right: document queue + signature placement
         right_panel = ttk.Frame(paned, padding=5)
         paned.add(right_panel, weight=1)
 
-        ttk.Label(right_panel, text="Firmas a colocar:", font=("", 10, "bold")).pack(
+        # Files to sign
+        ttk.Label(right_panel, text="Documentos a firmar:", font=("", 10, "bold")).pack(
+            anchor="w", pady=(0, 3)
+        )
+
+        files_frame = ttk.Frame(right_panel)
+        files_frame.pack(fill="x", pady=(0, 3))
+
+        self.files_listbox = tk.Listbox(
+            files_frame, height=4, font=("Consolas", 8), activestyle="dotbox"
+        )
+        files_vsb = ttk.Scrollbar(
+            files_frame, orient="vertical", command=self.files_listbox.yview
+        )
+        self.files_listbox.configure(yscrollcommand=files_vsb.set)
+        self.files_listbox.pack(side="left", fill="both", expand=True)
+        files_vsb.pack(side="right", fill="y")
+
+        self.files_listbox.bind("<<ListboxSelect>>", self._on_file_select)
+
+        files_btn_row = ttk.Frame(right_panel)
+        files_btn_row.pack(fill="x", pady=(0, 5))
+        ttk.Button(
+            files_btn_row, text="+ Agregar archivos", command=self.add_batch_files
+        ).pack(side="left", fill="x", expand=True)
+        ttk.Button(files_btn_row, text="Quitar", command=self.remove_batch_file).pack(
+            side="left", padx=(3, 0)
+        )
+
+        ttk.Separator(right_panel, orient="horizontal").pack(fill="x", pady=(0, 8))
+
+        # Signature placement
+        ttk.Label(right_panel, text="Posicion de firma:", font=("", 10, "bold")).pack(
             anchor="w", pady=(0, 5)
         )
 
@@ -858,7 +891,7 @@ class FirmaRapidaApp:
         list_frame = ttk.Frame(right_panel)
         list_frame.pack(fill="both", expand=True)
 
-        self.pos_listbox = tk.Listbox(list_frame, height=12, font=("Consolas", 9))
+        self.pos_listbox = tk.Listbox(list_frame, height=7, font=("Consolas", 9))
         list_vsb = ttk.Scrollbar(
             list_frame, orient="vertical", command=self.pos_listbox.yview
         )
@@ -881,17 +914,25 @@ class FirmaRapidaApp:
             side="left", fill="x", expand=True, padx=(3, 0)
         )
 
+        ttk.Button(
+            right_panel,
+            text="Replicar en todas las paginas",
+            command=self.replicate_to_all_pages,
+        ).pack(fill="x", pady=(3, 0))
+
         # Instructions
         ttk.Separator(right_panel, orient="horizontal").pack(fill="x", pady=10)
         instructions = (
             "Instrucciones:\n"
-            "1. Abra un PDF o Word\n"
-            "2. Clic '+ Agregar Firma'\n"
-            "   y haga clic en el documento\n"
-            "3. Arrastre las firmas para\n"
-            "   reposicionarlas\n"
-            "4. Supr para eliminar\n"
-            "5. Presione FIRMAR"
+            "1. Abrir un doc. de referencia\n"
+            "2. '+ Agregar archivos' para\n"
+            "   anadir mas al lote\n"
+            "3. Clic '+ Agregar Firma'\n"
+            "   en el documento\n"
+            "4. Arrastre para reposicionar\n"
+            "5. 'Replicar' para todas\n"
+            "   las paginas\n"
+            "6. Presione FIRMAR"
         )
         ttk.Label(
             right_panel, text=instructions, foreground="#555", justify="left"
@@ -1107,7 +1148,7 @@ class FirmaRapidaApp:
             self._temp_pdf = None
 
     def open_file(self):
-        """Open a PDF or Word document. Word files are auto-converted to PDF."""
+        """Open one document and start a new batch session."""
         init_dir = self.config["last_dir"] or str(Path.home())
         path = filedialog.askopenfilename(
             initialdir=init_dir,
@@ -1125,6 +1166,33 @@ class FirmaRapidaApp:
         self.config["last_dir"] = str(Path(path).parent)
         self.config.save()
 
+        # New session: clear batch list and signature positions
+        self.batch_files.clear()
+        self.files_listbox.delete(0, "end")
+        self.positions.clear()
+        self.pos_listbox.delete(0, "end")
+        self._selected_idx = None
+
+        # Load the file for preview (handles Word conversion internally)
+        self._load_for_preview(path)
+        if not self.pdf_doc:
+            return  # loading failed
+
+        # Register in batch list
+        self.batch_files.append(path)
+        self.files_listbox.insert("end", Path(path).name)
+        self.files_listbox.selection_set(0)
+
+        # Auto-enter placing mode
+        self._enter_placing_mode()
+        name = Path(path).name
+        word_note = " (convertido de Word)" if self.is_from_word else ""
+        self.status.config(
+            text=f"Abierto: {name}{word_note} ({self.total_pages} pag.) - Haga clic para colocar la primera firma"
+        )
+
+    def _load_for_preview(self, path):
+        """Load a file into the canvas preview without resetting the batch list or positions."""
         if self.pdf_doc:
             self.pdf_doc.close()
             self.pdf_doc = None
@@ -1138,7 +1206,6 @@ class FirmaRapidaApp:
             self.is_from_word = True
             self.status.config(text=f"Convirtiendo {Path(path).name} a PDF...")
             self.root.update_idletasks()
-
             try:
                 tmp_pdf = tempfile.NamedTemporaryFile(
                     suffix=".pdf",
@@ -1170,20 +1237,81 @@ class FirmaRapidaApp:
         self.pdf_path = pdf_to_open
         self.current_page = 0
         self.total_pages = len(self.pdf_doc)
-        self.positions.clear()
-        self.pos_listbox.delete(0, "end")
-        self._selected_idx = None
-
         self.render_page()
-        name = Path(self.original_path).name
-        word_note = " (convertido de Word)" if self.is_from_word else ""
+        name = Path(path).name
+        word_note = " (Word)" if self.is_from_word else ""
         self.root.title(f"Firma Rapida - {name}")
-
-        # Auto-enter placing mode so the first signature can be placed immediately
-        self._enter_placing_mode()
+        if path in self.batch_files:
+            idx = self.batch_files.index(path)
+            self.files_listbox.selection_clear(0, "end")
+            self.files_listbox.selection_set(idx)
         self.status.config(
-            text=f"Abierto: {name}{word_note} ({self.total_pages} pag.) - Haga clic para colocar la primera firma"
+            text=f"Previsualizando: {name}{word_note} ({self.total_pages} pag.)"
         )
+
+    def add_batch_files(self):
+        """Add more documents to the batch signing queue."""
+        init_dir = self.config["last_dir"] or str(Path.home())
+        files = filedialog.askopenfilenames(
+            initialdir=init_dir,
+            title="Agregar documentos al lote",
+            filetypes=[
+                ("PDF y Word", "*.pdf *.docx *.doc"),
+                ("Archivos PDF", "*.pdf"),
+                ("Documentos Word", "*.docx *.doc"),
+                ("Todos los archivos", "*.*"),
+            ],
+        )
+        if not files:
+            return
+        self.config["last_dir"] = str(Path(files[0]).parent)
+        self.config.save()
+        added = 0
+        for f in files:
+            if f not in self.batch_files:
+                self.batch_files.append(f)
+                self.files_listbox.insert("end", Path(f).name)
+                added += 1
+        # If no file is previewed yet, load the first one
+        if not self.pdf_doc and self.batch_files:
+            self._load_for_preview(self.batch_files[0])
+        self.status.config(
+            text=f"{added} archivo(s) agregado(s). Total en lote: {len(self.batch_files)}."
+        )
+
+    def remove_batch_file(self):
+        """Remove the selected file from the batch queue."""
+        sel = self.files_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        removed = self.batch_files.pop(idx)
+        self.files_listbox.delete(idx)
+        # If the removed file was being previewed, switch to another or clear canvas
+        if removed == self.original_path:
+            if self.batch_files:
+                self._load_for_preview(self.batch_files[0])
+            else:
+                if self.pdf_doc:
+                    self.pdf_doc.close()
+                    self.pdf_doc = None
+                self._cleanup_temp_pdf()
+                self.pdf_path = None
+                self.original_path = None
+                self.canvas.delete("all")
+                self.page_label.config(text="Sin documento")
+                self.root.title("Firma Rapida")
+        n = len(self.batch_files)
+        self.status.config(text=f"Archivo quitado. Quedan {n} en el lote.")
+
+    def _on_file_select(self, event):
+        """Preview the file selected in the documents listbox."""
+        sel = self.files_listbox.curselection()
+        if not sel:
+            return
+        path = self.batch_files[sel[0]]
+        if path != self.original_path:
+            self._load_for_preview(path)
 
     def render_page(self):
         if not self.pdf_doc:
@@ -1271,6 +1399,45 @@ class FirmaRapidaApp:
             self.render_page()
         self.status.config(text="Todas las firmas eliminadas")
 
+    def replicate_to_all_pages(self):
+        """Replicate the current page's signatures to every page of the document."""
+        if not self.pdf_doc:
+            messagebox.showinfo("Sin documento", "Abra un PDF primero.")
+            return
+        current_sigs = [p for p in self.positions if p.page == self.current_page]
+        if not current_sigs:
+            messagebox.showinfo(
+                "Sin firmas",
+                f"No hay firmas en la pagina {self.current_page + 1} para replicar.",
+            )
+            return
+        if self.total_pages == 1:
+            messagebox.showinfo(
+                "Una sola pagina", "El documento solo tiene una pagina."
+            )
+            return
+        if not messagebox.askyesno(
+            "Replicar firmas",
+            f"Replicar {len(current_sigs)} firma(s) de la pagina "
+            f"{self.current_page + 1} a las {self.total_pages} paginas del documento?\n\n"
+            "Las firmas existentes en otras paginas seran reemplazadas.",
+        ):
+            return
+        new_positions = []
+        for page_idx in range(self.total_pages):
+            for sig in current_sigs:
+                new_positions.append(SigPos(page_idx, sig.x, sig.y, sig.w, sig.h))
+        self.positions = new_positions
+        self.pos_listbox.delete(0, "end")
+        for p in self.positions:
+            self.pos_listbox.insert("end", str(p))
+        self._selected_idx = None
+        self.render_page()
+        self.status.config(
+            text=f"Firma replicada en {self.total_pages} paginas "
+            f"({len(self.positions)} posiciones en total)."
+        )
+
     def prev_page(self):
         if self.pdf_doc and self.current_page > 0:
             self.current_page -= 1
@@ -1287,9 +1454,9 @@ class FirmaRapidaApp:
     # ── Signing ─────────────────────────────────────────
 
     def do_sign(self):
-        """Execute the signing process."""
-        if not self.pdf_doc:
-            messagebox.showwarning("Sin documento", "Abra un PDF primero.")
+        """Sign all documents in the batch list at the placed signature positions."""
+        if not self.batch_files:
+            messagebox.showwarning("Sin documentos", "Agregue al menos un documento.")
             return
         if not self.positions:
             messagebox.showwarning(
@@ -1319,87 +1486,164 @@ class FirmaRapidaApp:
             pwd = dlg.password
             self.config.set_password(pwd)
 
-        stem = Path(self.original_path).stem
-        default_name = f"{stem}_firmado.pdf"
-        output = filedialog.asksaveasfilename(
-            initialdir=str(Path(self.original_path).parent),
-            initialfile=default_name,
-            title="Guardar PDF firmado como...",
-            filetypes=[("PDF", "*.pdf")],
-            defaultextension=".pdf",
-        )
-        if not output:
-            return
+        if self.pdf_doc:
+            self.pdf_doc.close()
+            self.pdf_doc = None
 
-        self.pdf_doc.close()
-        self.pdf_doc = None
+        # ── Single file: ask where to save ─────────────────────────────────
+        if len(self.batch_files) == 1:
+            orig = self.batch_files[0]
+            pdf_src = (
+                self.pdf_path
+                if (self.pdf_path and os.path.exists(str(self.pdf_path)))
+                else orig
+            )
+            stem = Path(orig).stem
+            default_name = f"{stem}_firmado.pdf"
+            output = filedialog.asksaveasfilename(
+                initialdir=str(Path(orig).parent),
+                initialfile=default_name,
+                title="Guardar PDF firmado como...",
+                filetypes=[("PDF", "*.pdf")],
+                defaultextension=".pdf",
+            )
+            if not output:
+                self._load_for_preview(orig)
+                return
 
-        # Remember page of first sig so we can navigate there after signing
-        _first_sig_page = self.positions[0].page if self.positions else 0
-        _signed_output = None  # set on success
-
-        try:
-            self.status.config(text="Firmando documento... por favor espere.")
-            self.root.update_idletasks()
-
-            sign_pdf(self.config, self.pdf_path, output, self.positions)
-            _signed_output = output
-
-            # ── Diagnostic: verify signature field placement in output PDF ──
-            _diag_warn = ""
+            _first_sig_page = self.positions[0].page if self.positions else 0
+            _signed_output = None
             try:
-                _d = fitz.open(output)
-                for _pgi in range(len(_d)):
-                    _pg = _d[_pgi]
-                    _pr = _pg.rect
-                    for _w in _pg.widgets():
-                        _wr = _w.rect
-                        if (
-                            _wr.x1 <= _pr.x0 or _wr.x0 >= _pr.x1
-                            or _wr.y1 <= _pr.y0 or _wr.y0 >= _pr.y1
-                        ):
-                            _diag_warn += (
-                                f"\n\u26a0 Pag.{_pgi+1}: rect de firma "
-                                f"({_wr.x0:.0f},{_wr.y0:.0f},{_wr.x1:.0f},{_wr.y1:.0f})"
-                                f" fuera de la pagina "
-                                f"({_pr.x0:.0f},{_pr.y0:.0f},{_pr.x1:.0f},{_pr.y1:.0f})"
-                            )
-                _d.close()
-            except Exception:
-                pass
+                self.status.config(text="Firmando documento... por favor espere.")
+                self.root.update_idletasks()
+                sign_pdf(self.config, pdf_src, output, self.positions)
+                _signed_output = output
 
-            msg = f"Documento firmado correctamente.\n\n{output}"
-            if _diag_warn:
-                msg += (
-                    "\n\n\u26a0 ATENCION: la firma fue colocada fuera del area"
-                    " visible de la pagina. Es posible que no se vea en el"
-                    " visor PDF." + _diag_warn
+                # ── Diagnostic: verify signature field placement ──
+                _diag_warn = ""
+                try:
+                    _d = fitz.open(output)
+                    for _pgi in range(len(_d)):
+                        _pg = _d[_pgi]
+                        _pr = _pg.rect
+                        for _w in _pg.widgets():
+                            _wr = _w.rect
+                            if (
+                                _wr.x1 <= _pr.x0
+                                or _wr.x0 >= _pr.x1
+                                or _wr.y1 <= _pr.y0
+                                or _wr.y0 >= _pr.y1
+                            ):
+                                _diag_warn += (
+                                    f"\n\u26a0 Pag.{_pgi+1}: rect de firma "
+                                    f"({_wr.x0:.0f},{_wr.y0:.0f},{_wr.x1:.0f},{_wr.y1:.0f})"
+                                    f" fuera de la pagina "
+                                    f"({_pr.x0:.0f},{_pr.y0:.0f},{_pr.x1:.0f},{_pr.y1:.0f})"
+                                )
+                    _d.close()
+                except Exception:
+                    pass
+
+                msg = f"Documento firmado correctamente.\n\n{output}"
+                if _diag_warn:
+                    msg += (
+                        "\n\n\u26a0 ATENCION: la firma fue colocada fuera del area"
+                        " visible de la pagina. Es posible que no se vea en el"
+                        " visor PDF." + _diag_warn
+                    )
+                self.status.config(text=f"Documento firmado: {Path(output).name}")
+                messagebox.showinfo("Firma exitosa", msg)
+                self.positions.clear()
+                self.pos_listbox.delete(0, "end")
+                self._selected_idx = None
+
+            except Exception as e:
+                messagebox.showerror("Error al firmar", f"Ocurrio un error:\n\n{e}")
+                self.status.config(text=f"Error: {e}")
+
+            finally:
+                show_path = (
+                    _signed_output
+                    if (_signed_output and os.path.exists(_signed_output))
+                    else pdf_src
                 )
+                if show_path and os.path.exists(str(show_path)):
+                    self.pdf_doc = fitz.open(show_path)
+                    self.pdf_path = show_path
+                    self.total_pages = len(self.pdf_doc)
+                    self.current_page = min(_first_sig_page, self.total_pages - 1)
+                    self.render_page()
+                    if _signed_output:
+                        self.status.config(
+                            text="Mostrando PDF firmado. Verifique la firma en el visor."
+                        )
 
-            self.status.config(text=f"Documento firmado: {Path(output).name}")
-            messagebox.showinfo("Firma exitosa", msg)
+        # ── Multiple files: batch sign, auto-save next to each original ────────
+        else:
+            ok = 0
+            batch_errors = []
+            for i, orig in enumerate(self.batch_files):
+                self.status.config(
+                    text=f"Firmando {i + 1}/{len(self.batch_files)}: {Path(orig).name}..."
+                )
+                self.root.update_idletasks()
+                tmp_pdf = None
+                try:
+                    ext = Path(orig).suffix.lower()
+                    if ext in (".docx", ".doc"):
+                        t = tempfile.NamedTemporaryFile(
+                            suffix=".pdf",
+                            delete=False,
+                            dir=tempfile.gettempdir(),
+                            prefix=f"{Path(orig).stem}_sign_",
+                        )
+                        t.close()
+                        tmp_pdf = t.name
+                        convert_docx_to_pdf(orig, tmp_pdf)
+                        pdf_src = tmp_pdf
+                    else:
+                        pdf_src = orig
+
+                    info = fitz.open(pdf_src)
+                    n_pages = len(info)
+                    info.close()
+
+                    valid_pos = [p for p in self.positions if p.page < n_pages]
+                    if not valid_pos:
+                        batch_errors.append(
+                            f"{Path(orig).name}: ninguna firma aplica "
+                            f"(doc tiene {n_pages} pag.)"
+                        )
+                        continue
+
+                    out = str(Path(orig).parent / f"{Path(orig).stem}_firmado.pdf")
+                    sign_pdf(self.config, pdf_src, out, valid_pos)
+                    ok += 1
+
+                except Exception as exc:
+                    batch_errors.append(f"{Path(orig).name}: {exc}")
+                finally:
+                    if tmp_pdf and os.path.exists(tmp_pdf):
+                        try:
+                            os.unlink(tmp_pdf)
+                        except OSError:
+                            pass
+
+            summary = f"Firmados: {ok} de {len(self.batch_files)} documento(s)."
+            if batch_errors:
+                summary += "\n\nErrores:\n" + "\n".join(f"• {e}" for e in batch_errors)
+                messagebox.showwarning("Firma en lote completada", summary)
+            else:
+                messagebox.showinfo("Firma en lote completada", summary)
             self.positions.clear()
             self.pos_listbox.delete(0, "end")
             self._selected_idx = None
-
-        except Exception as e:
-            messagebox.showerror("Error al firmar", f"Ocurrio un error:\n\n{e}")
-            self.status.config(text=f"Error: {e}")
-
-        finally:
-            # After signing, show the OUTPUT PDF so the user can immediately
-            # verify the signature appearance.  Fall back to the input on error.
-            show_path = _signed_output if (_signed_output and os.path.exists(_signed_output)) else self.pdf_path
-            if show_path and os.path.exists(show_path):
-                self.pdf_doc = fitz.open(show_path)
-                self.pdf_path = show_path
-                self.total_pages = len(self.pdf_doc)
-                self.current_page = min(_first_sig_page, self.total_pages - 1)
-                self.render_page()
-                if _signed_output:
-                    self.status.config(
-                        text="Mostrando PDF firmado. Verifique la firma en el visor."
-                    )
+            self.status.config(
+                text=f"Lote completado: {ok}/{len(self.batch_files)} firmados."
+            )
+            # Reload preview of first file
+            if self.batch_files:
+                self._load_for_preview(self.batch_files[0])
 
 
 # ── Entry point ────────────────────────────────────────────────────
